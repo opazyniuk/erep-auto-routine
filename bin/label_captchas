@@ -1,0 +1,395 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Local web UI for labeling captcha training data.
+# Shows saved captcha images, lets you click icons in order,
+# saves click coordinates + cropped pairs for CNN training.
+#
+# Usage:
+#   bin/label_captchas                           # default dirs
+#   bin/label_captchas path/to/captchas_dir      # custom source dir
+#
+# Opens http://localhost:4567
+
+require "webrick"
+require "json"
+require "fileutils"
+
+CAPTCHA_DIRS = [
+  File.expand_path("../../test/fixtures/captchas", __FILE__),
+  File.expand_path("../../log/captchas", __FILE__)
+]
+
+TRAINING_DIR = File.expand_path("../../data/training/samples", __FILE__)
+SCENE_HEIGHT = 200
+STRIP_HEIGHT = 30
+IMAGE_WIDTH  = 400
+PATCH_SIZE   = 64
+
+# Collect all full captcha images (skip splits, templates, match outputs)
+def find_captchas(dirs)
+  dirs.flat_map do |dir|
+    next [] unless Dir.exist?(dir)
+    Dir.glob(File.join(dir, "captcha_*.png")).select do |f|
+      base = File.basename(f)
+      !base.match?(/_top|_bot|_gray|_solved|_failed|_combined/)
+    end
+  end.sort
+end
+
+def already_labeled?(captcha_path)
+  id = File.basename(captcha_path, ".*")
+  manifest = File.join(TRAINING_DIR, id, "manifest.json")
+  File.exist?(manifest)
+end
+
+# Split image and crop patches using ImageMagick
+def save_training_data(captcha_path, coordinates)
+  id = File.basename(captcha_path, ".*")
+  sample_dir = File.join(TRAINING_DIR, id)
+  FileUtils.mkdir_p(sample_dir)
+
+  scene_path = File.join(sample_dir, "scene.png")
+  strip_path = File.join(sample_dir, "strip.png")
+
+  # Split: scene (top 200px) and strip (bottom 30px)
+  system("magick", captcha_path,
+         "-crop", "#{IMAGE_WIDTH}x#{SCENE_HEIGHT}+0+0", "+repage", scene_path)
+  system("magick", captcha_path,
+         "-crop", "#{IMAGE_WIDTH}x#{STRIP_HEIGHT}+0+#{SCENE_HEIGHT}",
+         "+repage", "-trim", "+repage", strip_path)
+
+  # Segment individual strip icons via connected components
+  segment_strip_icons(strip_path, sample_dir)
+
+  # Crop scene patches at click coordinates
+  coordinates.each_with_index do |coord, i|
+    patch_path = File.join(sample_dir, "patch_#{i}.png")
+    x = [coord["x"] - PATCH_SIZE / 2, 0].max
+    y = [coord["y"] - PATCH_SIZE / 2, 0].max
+    x = [x, IMAGE_WIDTH - PATCH_SIZE].min
+    y = [y, SCENE_HEIGHT - PATCH_SIZE].min
+
+    system("magick", scene_path,
+           "-crop", "#{PATCH_SIZE}x#{PATCH_SIZE}+#{x}+#{y}", "+repage", patch_path)
+  end
+
+  # Save manifest
+  manifest = {
+    id: id,
+    source: "manual",
+    timestamp: Time.now.iso8601,
+    captcha_path: captcha_path,
+    icon_count: coordinates.size,
+    coordinates: coordinates,
+    pairs: coordinates.each_index.map do |i|
+      { strip: "strip_#{i}.png", patch: "patch_#{i}.png" }
+    end
+  }
+
+  File.write(File.join(sample_dir, "manifest.json"), JSON.pretty_generate(manifest))
+  sample_dir
+end
+
+# Segment strip into individual icons by finding dark blobs on light/dark background
+def segment_strip_icons(strip_path, output_dir)
+  # Get strip dimensions
+  dims = `magick identify -format "%w %h" "#{strip_path}" 2>/dev/null`.strip.split.map(&:to_i)
+  return if dims.size < 2
+
+  w, h = dims
+
+  # Use connected components on thresholded image to find icon bounding boxes
+  cc_output = `magick "#{strip_path}" -colorspace Gray -negate -threshold 30% \
+    -define connected-components:verbose=true \
+    -define connected-components:area-threshold=100 \
+    -connected-components 8 null: 2>&1`
+
+  # Parse bounding boxes: "WxH+X+Y" format, filter small noise
+  regions = cc_output.scan(/(\d+)x(\d+)\+(\d+)\+(\d+)/).map do |bw, bh, bx, by|
+    { w: bw.to_i, h: bh.to_i, x: bx.to_i, y: by.to_i }
+  end
+
+  # Filter: keep regions that look like icons (reasonable size, not full image)
+  icons = regions.select { |r| r[:w].between?(10, w / 2) && r[:h].between?(10, h) }
+                 .sort_by { |r| r[:x] } # left to right
+
+  if icons.empty?
+    # Fallback: try uniform splitting based on image width
+    # Estimate icon count from aspect ratio (icons are roughly square, strip is wide)
+    estimated_count = (w.to_f / h).round.clamp(2, 8)
+    icon_w = w / estimated_count
+    icons = estimated_count.times.map { |i| { x: i * icon_w, y: 0, w: icon_w, h: h } }
+  end
+
+  icons.each_with_index do |region, i|
+    icon_path = File.join(output_dir, "strip_#{i}.png")
+    system("magick", strip_path,
+           "-crop", "#{region[:w]}x#{region[:h]}+#{region[:x]}+#{region[:y]}",
+           "+repage", icon_path)
+  end
+end
+
+# ── HTML/JS UI ──────────────────────────────────────────────────────
+
+PAGE_HTML = <<~'HTML'
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Captcha Labeler</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; }
+    .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+    h1 { font-size: 18px; margin-bottom: 16px; color: #8888cc; }
+    .status { margin-bottom: 12px; font-size: 14px; color: #888; }
+    .captcha-wrapper { position: relative; display: inline-block; cursor: crosshair; border: 2px solid #333; }
+    .captcha-wrapper img { display: block; }
+    .click-dot {
+      position: absolute; width: 20px; height: 20px; border-radius: 50%;
+      background: rgba(255, 50, 50, 0.8); border: 2px solid white;
+      transform: translate(-50%, -50%); pointer-events: none;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: bold; color: white;
+    }
+    .strip-preview { margin-top: 12px; border: 1px solid #333; }
+    .strip-preview img { display: block; }
+    .controls { margin-top: 16px; display: flex; gap: 10px; }
+    button {
+      padding: 8px 20px; border: none; border-radius: 4px; cursor: pointer;
+      font-size: 14px; font-weight: 500;
+    }
+    .btn-submit { background: #4CAF50; color: white; }
+    .btn-submit:disabled { background: #333; color: #666; cursor: not-allowed; }
+    .btn-undo { background: #ff9800; color: white; }
+    .btn-skip { background: #555; color: #ccc; }
+    .btn-clear { background: #f44336; color: white; }
+    .info { margin-top: 12px; font-size: 13px; color: #666; line-height: 1.6; }
+    .done { text-align: center; margin-top: 100px; font-size: 24px; color: #4CAF50; }
+    .click-list { margin-top: 8px; font-size: 13px; color: #aaa; }
+    .progress { font-size: 13px; color: #666; margin-bottom: 8px; }
+    .labeled-badge { display: inline-block; padding: 2px 8px; background: #2d4a2d; color: #6d6; border-radius: 3px; font-size: 12px; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Captcha Training Data Labeler</h1>
+    <div id="app"></div>
+  </div>
+  <script>
+    let captchas = [];
+    let currentIndex = 0;
+    let clicks = [];
+    let imgNaturalW = 0, imgNaturalH = 0;
+
+    async function loadCaptchas() {
+      const resp = await fetch('/api/captchas');
+      captchas = await resp.json();
+      render();
+    }
+
+    function render() {
+      const app = document.getElementById('app');
+      if (currentIndex >= captchas.length) {
+        app.innerHTML = '<div class="done">All captchas labeled!</div>';
+        return;
+      }
+
+      const c = captchas[currentIndex];
+      const labeledBadge = c.labeled ? '<span class="labeled-badge">labeled</span>' : '';
+
+      app.innerHTML = `
+        <div class="progress">${currentIndex + 1} / ${captchas.length} ${labeledBadge}</div>
+        <div class="status">${c.name}</div>
+        <div class="captcha-wrapper" id="captcha-area">
+          <img id="captcha-img" src="/api/image?path=${encodeURIComponent(c.path)}"
+               onload="onImageLoad(this)">
+        </div>
+        <div class="strip-preview">
+          <img src="/api/image?path=${encodeURIComponent(c.path)}"
+               style="object-fit: none; object-position: 0 -200px; height: 30px; width: 400px;">
+        </div>
+        <div class="click-list" id="click-list"></div>
+        <div class="controls">
+          <button class="btn-submit" id="btn-submit" disabled onclick="submitClicks()">
+            Save (0 clicks)
+          </button>
+          <button class="btn-undo" onclick="undoClick()">Undo</button>
+          <button class="btn-clear" onclick="clearClicks()">Clear</button>
+          <button class="btn-skip" onclick="nextCaptcha()">Skip &rarr;</button>
+        </div>
+        <div class="info">
+          Click icons in the scene (top area) in the same left-to-right order as the bottom strip.<br>
+          Typically 3-4 clicks needed. Scene area = top 200px only.
+        </div>
+      `;
+
+      clicks = [];
+      updateClickDisplay();
+
+      document.getElementById('captcha-area').addEventListener('click', onCaptchaClick);
+    }
+
+    function onImageLoad(img) {
+      imgNaturalW = img.naturalWidth;
+      imgNaturalH = img.naturalHeight;
+    }
+
+    function onCaptchaClick(e) {
+      const img = document.getElementById('captcha-img');
+      const rect = img.getBoundingClientRect();
+      const scaleX = imgNaturalW / rect.width;
+      const scaleY = imgNaturalH / rect.height;
+
+      const x = Math.round((e.clientX - rect.left) * scaleX);
+      const y = Math.round((e.clientY - rect.top) * scaleY);
+
+      // Only accept clicks in scene area (top 200px)
+      if (y > 200) return;
+
+      clicks.push({ x, y });
+      renderDot(e.clientX - rect.left, e.clientY - rect.top, clicks.length);
+      updateClickDisplay();
+    }
+
+    function renderDot(displayX, displayY, num) {
+      const dot = document.createElement('div');
+      dot.className = 'click-dot';
+      dot.style.left = displayX + 'px';
+      dot.style.top = displayY + 'px';
+      dot.textContent = num;
+      document.getElementById('captcha-area').appendChild(dot);
+    }
+
+    function updateClickDisplay() {
+      const btn = document.getElementById('btn-submit');
+      const list = document.getElementById('click-list');
+      if (!btn) return;
+
+      btn.textContent = `Save (${clicks.length} clicks)`;
+      btn.disabled = clicks.length === 0;
+
+      list.innerHTML = clicks.map((c, i) =>
+        `${i + 1}. (${c.x}, ${c.y})`
+      ).join(' &nbsp;&nbsp; ');
+    }
+
+    function undoClick() {
+      if (clicks.length === 0) return;
+      clicks.pop();
+      // Re-render dots
+      const area = document.getElementById('captcha-area');
+      const dots = area.querySelectorAll('.click-dot');
+      if (dots.length) dots[dots.length - 1].remove();
+      updateClickDisplay();
+    }
+
+    function clearClicks() {
+      clicks = [];
+      const area = document.getElementById('captcha-area');
+      area.querySelectorAll('.click-dot').forEach(d => d.remove());
+      updateClickDisplay();
+    }
+
+    async function submitClicks() {
+      const c = captchas[currentIndex];
+      const resp = await fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: c.path, coordinates: clicks })
+      });
+      const result = await resp.json();
+      if (result.ok) {
+        captchas[currentIndex].labeled = true;
+        nextCaptcha();
+      } else {
+        alert('Error: ' + result.error);
+      }
+    }
+
+    function nextCaptcha() {
+      currentIndex++;
+      render();
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'z' && (e.metaKey || e.ctrlKey)) { undoClick(); e.preventDefault(); }
+      if (e.key === 'Enter') { if (clicks.length > 0) submitClicks(); }
+      if (e.key === 'ArrowRight') { nextCaptcha(); }
+    });
+
+    loadCaptchas();
+  </script>
+</body>
+</html>
+HTML
+
+# ── Server ──────────────────────────────────────────────────────────
+
+captcha_dirs = ARGV.empty? ? CAPTCHA_DIRS : ARGV
+captchas = find_captchas(captcha_dirs)
+
+if captchas.empty?
+  warn "No captcha images found in: #{captcha_dirs.join(', ')}"
+  warn "Looking for files matching captcha_*.png (excluding _top, _bot, _gray, _solved, _failed)"
+  exit 1
+end
+
+labeled_count = captchas.count { |c| already_labeled?(c) }
+puts "Found #{captchas.size} captcha(s) (#{labeled_count} already labeled)"
+puts "Training data: #{TRAINING_DIR}"
+puts "Starting at http://localhost:4567"
+
+server = WEBrick::HTTPServer.new(Port: 4567, Logger: WEBrick::Log.new("/dev/null"), AccessLog: [])
+
+# Serve main page
+server.mount_proc "/" do |_req, res|
+  res["Content-Type"] = "text/html"
+  res.body = PAGE_HTML
+end
+
+# List captchas
+server.mount_proc "/api/captchas" do |_req, res|
+  res["Content-Type"] = "application/json"
+  res.body = captchas.map { |path|
+    { name: File.basename(path), path: path, labeled: already_labeled?(path) }
+  }.to_json
+end
+
+# Serve images (from any path on disk)
+server.mount_proc "/api/image" do |req, res|
+  path = req.query["path"]
+  if path && File.exist?(path)
+    res["Content-Type"] = "image/png"
+    res["Cache-Control"] = "max-age=3600"
+    res.body = File.binread(path)
+  else
+    res.status = 404
+    res.body = "not found"
+  end
+end
+
+# Save labeled data
+server.mount_proc "/api/save" do |req, res|
+  res["Content-Type"] = "application/json"
+  begin
+    data = JSON.parse(req.body)
+    path = data["path"]
+    coordinates = data["coordinates"]
+
+    unless File.exist?(path)
+      res.body = { ok: false, error: "file not found" }.to_json
+      next
+    end
+
+    sample_dir = save_training_data(path, coordinates)
+    res.body = { ok: true, sample_dir: sample_dir, pairs: coordinates.size }.to_json
+  rescue => e
+    res.body = { ok: false, error: e.message }.to_json
+  end
+end
+
+trap("INT") { server.shutdown }
+server.start

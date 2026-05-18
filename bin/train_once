@@ -1,0 +1,34 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv/load"
+require_relative "../lib/erep"
+
+# Skip if already ran today
+lock_dir = File.expand_path("../log", __dir__)
+Dir.mkdir(lock_dir) unless Dir.exist?(lock_dir)
+lock_file = File.join(lock_dir, "last_run")
+
+if File.exist?(lock_file) && File.read(lock_file).strip == Time.now.strftime("%Y-%m-%d")
+  puts "[#{Time.now}] Already ran today, skipping."
+  exit 0
+end
+
+# Prevent concurrent runs (launchd fires queued triggers simultaneously on wake)
+lock_fd = File.open(File.join(lock_dir, "train.lock"), File::RDWR | File::CREAT)
+unless lock_fd.flock(File::LOCK_EX | File::LOCK_NB)
+  puts "[#{Time.now}] Another instance running, skipping."
+  exit 0
+end
+
+email = ENV.fetch("EREP_EMAIL") { abort "Set EREP_EMAIL in .env" }
+password = ENV.fetch("EREP_PASSWORD") { abort "Set EREP_PASSWORD in .env" }
+
+success = Erep::Trainer.new(email: email, password: password).run
+
+if success
+  File.write(lock_file, Time.now.strftime("%Y-%m-%d"))
+else
+  puts "[#{Time.now}] Training failed, will retry on next run."
+  exit 1
+end

@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv/load"
+require_relative "../lib/erep"
+
+# Prevent concurrent runs
+log_dir = File.expand_path("../log", __dir__)
+Dir.mkdir(log_dir) unless Dir.exist?(log_dir)
+
+pid_file = File.join(log_dir, "fight.pid")
+if File.exist?(pid_file)
+  old_pid = File.read(pid_file).strip.to_i
+  if old_pid > 0
+    begin
+      Process.kill(0, old_pid)
+      puts "[#{Time.now}] Another fight instance running (PID #{old_pid}), skipping."
+      exit 0
+    rescue Errno::ESRCH
+      # stale PID, continue
+    end
+  end
+end
+File.write(pid_file, Process.pid.to_s)
+at_exit { File.delete(pid_file) rescue nil }
+
+email = ENV.fetch("EREP_EMAIL") { abort "Set EREP_EMAIL in .env" }
+password = ENV.fetch("EREP_PASSWORD") { abort "Set EREP_PASSWORD in .env" }
+
+success = Erep::Fighter.new(email: email, password: password).run
+
+unless success
+  puts "[#{Time.now}] Fight session failed."
+  exit 1
+end

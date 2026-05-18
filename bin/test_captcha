@@ -1,0 +1,120 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Test captcha solver against fixture or live captcha images.
+#
+# Usage: CAPTCHA_BACKEND=gemini ruby bin/test_captcha [path] [flags]
+#   --pipeline    Use full SolvePipeline (LLM identify + template match) [default]
+#   --llm-only    Use LLM for both identification and coordinates
+#   --templates   Skip LLM, match all templates against scene (slow but no API)
+
+require "dotenv/load"
+require "base64"
+require_relative "../lib/erep"
+
+captcha_path = ARGV.reject { |a| a.start_with?("--") }.first || "test/fixtures/captchas/captcha_2.png"
+mode = if ARGV.include?("--llm-only")
+         :llm_only
+       elsif ARGV.include?("--templates")
+         :templates
+       else
+         :pipeline
+       end
+
+abort "File not found: #{captcha_path}" unless File.exist?(captcha_path)
+
+basename = File.basename(captcha_path, ".*")
+fixtures_dir = File.expand_path("../test/fixtures/captchas", __dir__)
+
+puts "Captcha: #{captcha_path}"
+puts "Mode: #{mode}"
+
+case mode
+when :pipeline
+  # Full pipeline: LLM identifies strip icons, template matcher locates in scene
+  logger = ->(msg) { puts msg }
+  pipeline = Erep::Captcha::SolvePipeline.new(log_method: logger, work_dir: fixtures_dir)
+
+  t = Time.now
+  coords = pipeline.solve(captcha_path, icon_count: 3)
+  puts "\nPipeline result (#{(Time.now - t).round(1)}s): #{coords.inspect}"
+
+  # Normalize keys to strings for drawing
+  coords = coords.map { |c| { "x" => c[:x], "y" => c[:y] } }
+
+when :templates
+  # Template-only: match all 7 templates against the scene (no LLM)
+  preprocessor = Erep::Captcha::ImagePreprocessor.new(work_dir: fixtures_dir)
+  parts = preprocessor.split(captcha_path)
+
+  catalog = Erep::Captcha::IconCatalog.new
+  matcher = Erep::TemplateMatcher.new(work_dir: fixtures_dir)
+
+  puts "\nMatching all #{catalog.all_names.size} templates (parallel)..."
+  t = Time.now
+  results = matcher.match_icons(catalog.all_names, catalog, parts[:top_gray])
+  elapsed = (Time.now - t).round(1)
+
+  results.compact.each do |r|
+    puts "  #{r[:name]}: (#{r[:x]}, #{r[:y]}) score=#{r[:score].round(4)}"
+  end
+  puts "Done in #{elapsed}s"
+
+  coords = results.compact.map { |r| { "x" => r[:x], "y" => r[:y] } }
+
+when :llm_only
+  # Pure LLM: identify + locate via vision model
+  preprocessor = Erep::Captcha::ImagePreprocessor.new(work_dir: fixtures_dir)
+  parts = preprocessor.split(captcha_path)
+
+  solver = Erep::CaptchaSolver.new
+  bot_b64 = Base64.strict_encode64(File.binread(parts[:bottom]))
+  top_b64 = Base64.strict_encode64(File.binread(parts[:top]))
+
+  puts "\nIdentifying icons..."
+  t = Time.now
+  icons = solver.identify_icons(bot_b64)
+  puts "  Icons (#{(Time.now - t).round(1)}s): #{icons.inspect}"
+
+  puts "\nLocating in scene..."
+  t = Time.now
+  coords = solver.locate_icons(top_b64, icons)
+  puts "  Coords (#{(Time.now - t).round(1)}s): #{coords.inspect}"
+end
+
+if coords.empty?
+  puts "No coordinates returned — cannot draw dots."
+  exit 1
+end
+
+# Print color legend
+colors = %w[red blue green orange purple]
+puts "\nClick order (matching bottom strip left→right):"
+coords.each_with_index do |c, i|
+  puts "  #{i + 1}. #{colors[i].upcase} dot → (#{c['x']}, #{c['y']})"
+end
+
+# Draw colored dots on the original color top image
+top_path = File.join(fixtures_dir, "#{basename}_top.png")
+bot_path = File.join(fixtures_dir, "#{basename}_bot.png")
+output_path = File.join(fixtures_dir, "#{basename}_result.png")
+
+draw_commands = coords.each_with_index.flat_map do |c, i|
+  x = c["x"]
+  y = c["y"]
+  color = colors[i] || "red"
+  [
+    "-fill", "none", "-stroke", color, "-strokewidth", "3",
+    "-draw", "circle #{x},#{y} #{x + 12},#{y}",
+    "-fill", color, "-stroke", "none",
+    "-draw", "circle #{x},#{y} #{x + 4},#{y}"
+  ]
+end
+
+system("magick", top_path, *draw_commands, output_path)
+
+combined_path = File.join(fixtures_dir, "#{basename}_combined.png")
+system("magick", output_path, bot_path, "-gravity", "South", "-append", combined_path)
+
+puts "\nResult: #{combined_path}"
+puts "Open with: open #{combined_path}"

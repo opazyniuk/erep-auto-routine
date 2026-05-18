@@ -1,0 +1,16 @@
+.env
+CLAUDE.md
+prompts.md
+log/
+test/fixtures/captchas/
+
+# Local-only configuration (hardcoded paths to user's home / brew)
+*.plist
+bin/cron_*
+data/
+models/
+tmp/
+.idea/
+.claude/
+.DS_Store
+**/.DS_Store
