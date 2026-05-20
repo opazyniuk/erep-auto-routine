@@ -864,7 +864,21 @@ module Erep
 
     def infantry_kit_active?
       log "Checking Infantry Kit status..."
-      browser.go_to("#{BASE_URL}/en/citizen/profile/REDACTED")
+      ensure_on_main_page
+      citizen_id = browser.evaluate(<<~JS)
+        (function() {
+          var sd = typeof SERVER_DATA !== 'undefined' ? SERVER_DATA : null;
+          if (!sd && typeof erepublik !== 'undefined') sd = erepublik.settings;
+          return sd && (sd.citizenId || sd.citizen_id);
+        })()
+      JS
+
+      unless citizen_id
+        log "Could not read citizen ID from SERVER_DATA — assuming Infantry Kit NOT active"
+        return false
+      end
+
+      browser.go_to("#{BASE_URL}/en/citizen/profile/#{citizen_id}")
       sleep 3
 
       active = browser.evaluate(<<~JS)
