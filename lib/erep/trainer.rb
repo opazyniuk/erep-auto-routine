@@ -35,7 +35,7 @@ module Erep
 
       log "Done | train=#{train_result} pro_contract=#{pro_contract_result} vip=#{vip_result} energy_bars=#{energy_bars_result} gold=#{gold_result}"
       log separator
-      true
+      train_result != :error
     rescue => e
       log "FAILED | #{e.message}"
       log e.backtrace.first(5).join("\n")

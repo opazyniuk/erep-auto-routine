@@ -7,6 +7,7 @@ test/fixtures/captchas/
 # Local-only configuration (hardcoded paths to user's home / brew)
 *.plist
 bin/cron_*
+config/countries.rb
 data/
 models/
 tmp/

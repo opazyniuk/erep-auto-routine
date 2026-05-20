@@ -1,13 +1,15 @@
 # frozen_string_literal: true
 
+require_relative "../../config/countries"
+
 module Erep
   class BattleSelector
-    ENEMIES = [73, 74, 65, 69].freeze # Russia, Croatia, Serbia, BiH
+    ENEMIES = Erep::Config::ENEMIES
+    FRIENDS = Erep::Config::FRIENDS
     DIV_KEY = "div" # division key in campaign JSON
 
-    def initialize(campaigns_json, alliance_member_ids:)
+    def initialize(campaigns_json)
       @campaigns = campaigns_json
-      @alliance_ids = alliance_member_ids
     end
 
     def select_targets
@@ -24,7 +26,7 @@ module Erep
       battle_id = battle["id"] || battle["battle_id"]
 
       return nil if involves_enemy?(invader_id, defender_id)
-      return nil unless involves_alliance?(invader_id, defender_id)
+      return nil unless involves_friend?(invader_id, defender_id)
 
       div3 = find_div3_zone(battle)
       return nil unless div3
@@ -62,8 +64,8 @@ module Erep
       ENEMIES.include?(invader_id.to_i) || ENEMIES.include?(defender_id.to_i)
     end
 
-    def involves_alliance?(invader_id, defender_id)
-      @alliance_ids.include?(invader_id.to_i) || @alliance_ids.include?(defender_id.to_i)
+    def involves_friend?(invader_id, defender_id)
+      FRIENDS.include?(invader_id.to_i) || FRIENDS.include?(defender_id.to_i)
     end
 
     def find_div3_zone(battle)

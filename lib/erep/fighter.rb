@@ -10,35 +10,6 @@ module Erep
     LOG_PATH = File.expand_path("../../log/fight.log", __dir__)
     LOG_FILE = File.open(LOG_PATH, "a")
 
-    # Alliance 34 member + Ukraine friends country IDs
-    ALLIANCE_IDS = [
-      40,  # Ukraine
-      44,  # Greece
-      59,  # Thailand
-      71,  # Latvia
-      72,  # Lithuania
-      80,  # Montenegro
-      82,  # Cyprus
-      83,  # Belarus
-      164, # Saudi Arabia
-      166, # United Arab Emirates
-      1,   # Romania
-      42,  # Bulgaria
-      24,  # USA
-      30,  # Switzerland
-      53,  # Portugal
-      165, # Egypt
-      52,  # Moldova
-      31,  # Netherlands
-      50,  # Australia
-      78,  # Colombia
-      26,  # Mexico
-      81,  # Taiwan
-      54,  # Ireland
-      29,  # United Kingdom
-      79   # Macedonia
-    ].freeze
-
     def initialize(email:, password:)
       @email = email
       @password = password
@@ -91,7 +62,7 @@ module Erep
       campaigns = @browser.fetch_campaigns
 
       # 5. Select eligible battles
-      selector = BattleSelector.new(campaigns, alliance_member_ids: ALLIANCE_IDS)
+      selector = BattleSelector.new(campaigns)
       targets = selector.select_targets
       log "Found #{targets.size} eligible battle(s)"
 

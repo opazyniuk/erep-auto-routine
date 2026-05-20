@@ -18,7 +18,7 @@ module Erep
     CDP_PORT = 9232
 
     CAPTCHA_SOLVE_MODE = :user # :user = wait for manual solve, :auto = use pipeline solver
-    CAPTCHA_USER_TIMEOUT = 30 # seconds to wait for user to solve captcha
+    CAPTCHA_USER_TIMEOUT = 240 # seconds to wait for user to solve captcha
     CAPTCHA_LOG_PATH = File.expand_path("../../log/captcha.log", __dir__)
 
     def initialize(log_file: nil)
@@ -26,10 +26,9 @@ module Erep
       Dir.mkdir(CHROME_PROFILE_DIR) unless Dir.exist?(CHROME_PROFILE_DIR)
       kill_stale_chrome
 
-      # Phase 1: Seed cf_clearance cookie (skip if still valid)
-      seed_cloudflare_clearance unless cf_clearance_valid?
-
-      # Phase 2: Relaunch with debugging port. cf_clearance cookie persists in the profile.
+      # Skip Phase 1 preemptively — session cookie usually lets the page render
+      # logged-in even when cf_clearance looks stale. login() retries with a
+      # fresh seed only if Cloudflare actually blocks.
       launch_chrome_with_cdp
       log "Browser ready"
     end
@@ -119,6 +118,9 @@ module Erep
       log "Train result: #{result_json}"
 
       result = JSON.parse(result_json) rescue {}
+      api_confirmed = result["result"] || result["status"] == "already_trained"
+      raise TrainError, "Train API did not confirm success: #{result_json}" unless api_confirmed
+
       if result["result"]
         r = result["result"]
         log "Trained! +#{r['strength_bonus']} strength, +#{r['xp']} XP, +#{r['gold']} gold"
@@ -374,9 +376,16 @@ module Erep
 
       sleep 5
       result_json = browser.evaluate("window.__buyGoldResult") rescue nil
-      log "Buy gold result: #{result_json}"
-
       result = JSON.parse(result_json || "{}") rescue {}
+
+      summary = {
+        status: result["status"],
+        bought: result["bought"],
+        unfilled: result["unfilled"],
+        cc_delta: (result["cc_before"] && result["cc_after"]) ? (result["cc_before"] - result["cc_after"]).round(4) : nil,
+        gold_delta: (result["gold_before"] && result["gold_after"]) ? (result["gold_after"] - result["gold_before"]).round(4) : nil
+      }
+      log "Buy gold result: #{summary.compact.to_json}"
 
       case result["status"]
       when "done"
@@ -983,15 +992,26 @@ module Erep
       loop do
         elapsed = (Time.now - start).to_i
 
-        # Check if verification box / modal is still present
+        # Check if verification box / modal is actually visible to the user.
+        # Mere DOM presence isn't enough — after a manual solve these elements
+        # often linger hidden, and SERVER_DATA.sessionValidation stays stale
+        # until a reload. Use computed style + offsetParent for true visibility.
         still_needs_verification = browser.evaluate(<<~JS)
           (function() {
+            function visible(el) {
+              if (!el) return false;
+              if (el.offsetParent === null) return false;
+              var st = window.getComputedStyle(el);
+              if (st.display === 'none' || st.visibility === 'hidden') return false;
+              if (parseFloat(st.opacity) === 0) return false;
+              var rect = el.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) return false;
+              return true;
+            }
             var modal = document.querySelector('#sessionUnlockModal');
-            if (modal && modal.style.display !== 'none') return 'modal';
+            if (visible(modal)) return 'modal';
             var vBox = document.querySelector('#verificationBox');
-            if (vBox) return 'box';
-            var sd = typeof SERVER_DATA !== 'undefined' ? SERVER_DATA : null;
-            if (sd && sd.sessionValidation) return 'server_data';
+            if (visible(vBox)) return 'box';
             return null;
           })()
         JS
@@ -1723,8 +1743,10 @@ module Erep
 
         # SIGTERM on the launcher PID leaves Chrome helper processes alive and
         # holding the profile; kill everything bound to the profile dir instead.
-        Process.wait(seed_pid) rescue nil
+        # Kill first, then reap — otherwise we deadlock when Turnstile doesn't
+        # auto-solve and Chrome sits on the page indefinitely.
         kill_stale_chrome
+        Process.wait(seed_pid) rescue nil
 
         if clearance_found
           log "Phase 1 done — cf_clearance obtained"
