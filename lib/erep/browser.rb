@@ -347,8 +347,15 @@ module Erep
               const buyData = await buyResp.json();
 
               if (buyData.error) {
-                purchases.push({ offer_id: o.offer_id, price: o.price, requested: take, error: buyData.message || 'unknown' });
-                break;
+                const msg = (buyData.message || '').toString().toLowerCase();
+                const code = (buyData.code || '').toString().toLowerCase();
+                const isFatal = msg.includes('not_enough_money') ||
+                                msg.includes('not enough money') ||
+                                msg.includes('insufficient') ||
+                                code.includes('not_enough_money');
+                purchases.push({ offer_id: o.offer_id, price: o.price, requested: take, error: buyData.message || 'unknown', fatal: isFatal });
+                if (isFatal) break;
+                continue;
               }
 
               myCc = parseFloat((buyData.ecash || {}).value || myCc);
@@ -1495,6 +1502,8 @@ module Erep
       browser.go_to("#{BASE_URL}/en")
       sleep 3
 
+      dump_login_state("initial")
+
       if logged_in?
         log "Already logged in via session"
         return :logged_in
@@ -1514,9 +1523,38 @@ module Erep
         return email_field if email_field
         return nil if cloudflare_challenge_present?
         log "Login form not ready, waiting... (attempt #{i + 1}/3)"
+        dump_login_state("retry_#{i + 1}") if i == 2
       end
 
       nil
+    end
+
+    def dump_login_state(label)
+      snapshot = browser.evaluate(<<~JS) rescue nil
+        (function() {
+          var visible = function(sel) {
+            var els = document.querySelectorAll(sel);
+            var count = 0;
+            for (var i = 0; i < els.length; i++) {
+              var s = window.getComputedStyle(els[i]);
+              if (s.display !== 'none' && s.visibility !== 'hidden' && els[i].offsetParent !== null) count++;
+            }
+            return { total: els.length, visible: count };
+          };
+          return {
+            url: location.href,
+            title: document.title,
+            citizen_email: !!document.querySelector('#citizen_email'),
+            login_form: visible('#login_form, form[action*="login"]'),
+            logout_markers: visible('#logout, .logout, [href*="logout"]'),
+            has_serverdata: typeof window.SERVER_DATA !== 'undefined',
+            has_citizenid_json: document.body.innerHTML.indexOf('"citizenId"') !== -1
+          };
+        })()
+      JS
+      log "DOM state [#{label}]: #{snapshot.to_json}"
+    rescue => e
+      log "dump_login_state[#{label}] failed: #{e.message}"
     end
 
     # ── Captcha helpers ──────────────────────────────────────────
@@ -1909,12 +1947,27 @@ module Erep
     def logged_in?
       browser.evaluate(<<~JS) rescue false
         (function() {
-          // If there's a Sign In button, we're NOT logged in
-          var signIn = document.querySelector('.sign_in, #login_form, button.login');
-          if (signIn) return false;
-          // Check for logged-in indicators
-          return document.body.innerHTML.includes('erepublik.settings') ||
-                 document.querySelector('#logout, .logout, [href*="logout"], .user_avatar, #profileButton') !== null;
+          // Primary signal: erepublik bootstraps a SERVER_DATA global with citizenId on logged-in pages
+          if (typeof window.SERVER_DATA === 'object' && window.SERVER_DATA &&
+              (window.SERVER_DATA.citizenId || (window.SERVER_DATA.citizen && window.SERVER_DATA.citizen.citizenId))) {
+            return true;
+          }
+
+          // Secondary: presence of a *visible* logout link
+          var isVisible = function(el) {
+            if (!el) return false;
+            var s = window.getComputedStyle(el);
+            return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+          };
+          var positives = document.querySelectorAll('#logout, .logout, [href*="logout"]');
+          for (var i = 0; i < positives.length; i++) {
+            if (isVisible(positives[i])) return true;
+          }
+
+          // Tertiary: SERVER_DATA blob written as inline JSON
+          if (document.body.innerHTML.indexOf('"citizenId"') !== -1) return true;
+
+          return false;
         })()
       JS
     end
