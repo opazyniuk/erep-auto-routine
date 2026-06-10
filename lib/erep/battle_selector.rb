@@ -5,6 +5,7 @@ require_relative "../../config/countries"
 module Erep
   class BattleSelector
     ENEMIES = Erep::Config::ENEMIES
+    ENEMY_PERMALINKS = Erep::Config::ENEMY_PERMALINKS
     FRIENDS = Erep::Config::FRIENDS
     DIV_KEY = "div" # division key in campaign JSON
 

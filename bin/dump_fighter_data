@@ -1,0 +1,46 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv/load"
+require "json"
+require_relative "../lib/erep"
+
+email = ENV.fetch("EREP_EMAIL") { abort "Set EREP_EMAIL in .env" }
+password = ENV.fetch("EREP_PASSWORD") { abort "Set EREP_PASSWORD in .env" }
+
+log_file = File.open(File.expand_path("../log/dump.log", __dir__), "a")
+browser = Erep::Browser.new(log_file: log_file)
+
+begin
+  browser.login(email, password)
+  browser.handle_verification
+
+  # Use the same selector the fighter uses — gives real battleZoneId
+  campaigns = browser.fetch_campaigns
+  targets = Erep::BattleSelector.new(campaigns).select_targets
+  abort "No eligible targets" if targets.empty?
+  target = targets.first
+  puts "Picked battle #{target[:battle_id]} zone #{target[:zone_id]}"
+
+  puts "Battle #{target[:battle_id]} zone #{target[:zone_id]}"
+
+  stats = browser.fetch_battle_stats(target[:battle_id], 3, target[:zone_id])
+
+  out_path = File.expand_path("../log/fighter_data_dump.json", __dir__)
+  File.write(out_path, JSON.pretty_generate(stats))
+  puts "Dumped to #{out_path}"
+
+  # Print just one fighter for quick inspection
+  stats.each do |key, side_data|
+    next if key == "rounds"
+    next unless side_data.is_a?(Hash)
+    fd = side_data["fighterData"]
+    next unless fd.is_a?(Hash) && fd.any?
+    first = fd.values.first
+    puts "\nSide #{key} first fighter keys: #{first.keys.inspect}"
+    puts JSON.pretty_generate(first)
+    break
+  end
+ensure
+  browser&.quit
+end

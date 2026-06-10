@@ -150,7 +150,7 @@ module Erep
       round_fighters = @browser.analyze_round_fighters(battle_id, zone_id)
 
       if round_fighters.any?
-        enemy_fighters = round_fighters.select { |f| BattleSelector::ENEMIES.include?(f[:citizenship]) }
+        enemy_fighters = round_fighters.select { |f| BattleSelector::ENEMY_PERMALINKS.include?(f[:citizenship_permalink]) }
 
         if enemy_fighters.empty?
           log "Round occupied by non-enemy, skipping battle #{battle_id}"

@@ -24,11 +24,13 @@ module Erep
     def initialize(log_file: nil)
       @log_file = log_file
       Dir.mkdir(CHROME_PROFILE_DIR) unless Dir.exist?(CHROME_PROFILE_DIR)
-      kill_stale_chrome
 
-      # Skip Phase 1 preemptively — session cookie usually lets the page render
-      # logged-in even when cf_clearance looks stale. login() retries with a
-      # fresh seed only if Cloudflare actually blocks.
+      if attach_to_existing_chrome
+        log "Browser ready (reused existing Chrome on CDP port #{CDP_PORT})"
+        return
+      end
+
+      kill_stale_chrome
       launch_chrome_with_cdp
       log "Browser ready"
     end
@@ -827,19 +829,19 @@ module Erep
         next unless fighter_data.is_a?(Hash)
 
         fighter_data.each_value do |f|
-          citizenship = f["citizenshipCountryId"] || f["countryId"] || f["citizenCountryId"]
           fighters << {
             side_country_id: key.to_i,
             citizen_id: f["citizenId"],
             name: f["citizenName"],
-            damage: f["damage"].to_i,
-            citizenship: citizenship.to_i
+            damage: (f["raw_value"] || f["damage"]).to_i,
+            citizenship_permalink: f["country_permalink"],
+            citizenship_name: f["country_name"]
           }
         end
       end
 
       if fighters.any?
-        fighters.each { |f| log "Side #{f[:side_country_id]}: #{f[:name]} (citizenship=#{f[:citizenship]}, damage=#{f[:damage]})" }
+        fighters.each { |f| log "Side #{f[:side_country_id]}: #{f[:name]} (#{f[:citizenship_permalink]}, damage=#{f[:damage]})" }
       else
         log "Round empty, proceeding"
       end
@@ -872,30 +874,47 @@ module Erep
     def infantry_kit_active?
       log "Checking Infantry Kit status..."
       ensure_on_main_page
-      citizen_id = browser.evaluate(<<~JS)
-        (function() {
-          var sd = typeof SERVER_DATA !== 'undefined' ? SERVER_DATA : null;
-          if (!sd && typeof erepublik !== 'undefined') sd = erepublik.settings;
-          return sd && (sd.citizenId || sd.citizen_id);
-        })()
-      JS
+      citizen_id = extract_citizen_id
 
       unless citizen_id
-        log "Could not read citizen ID from SERVER_DATA — assuming Infantry Kit NOT active"
+        log "Could not read citizen ID — assuming Infantry Kit NOT active"
+        save_screenshot("citizen_id_missing")
         return false
       end
 
       browser.go_to("#{BASE_URL}/en/citizen/profile/#{citizen_id}")
       sleep 3
 
-      active = browser.evaluate(<<~JS)
+      result = browser.evaluate(<<~JS)
         (function() {
-          var el = document.querySelector('span.no_xp_fight');
-          return el !== null;
+          var selectors = [
+            'span.no_xp_fight',
+            '.no_xp_fight',
+            '[data-booster*="infantry_kit"]',
+            '[class*="infantry_kit"]',
+            '[class*="infantryKit"]'
+          ];
+          for (var i = 0; i < selectors.length; i++) {
+            if (document.querySelector(selectors[i])) {
+              return { active: true, matched: selectors[i] };
+            }
+          }
+          // Text-based fallback — Infantry Kit tooltip / label
+          var html = document.body.innerHTML.toLowerCase();
+          if (html.indexOf('no_xp_fight') !== -1 || html.indexOf('infantry kit') !== -1) {
+            return { active: true, matched: 'text-match' };
+          }
+          return { active: false, matched: null };
         })()
       JS
 
-      log "Infantry Kit: #{active ? 'ACTIVE' : 'NOT ACTIVE'}"
+      active = result && result["active"]
+      if active
+        log "Infantry Kit: ACTIVE (matched #{result['matched']})"
+      else
+        log "Infantry Kit: NOT ACTIVE (no marker found on profile)"
+        save_screenshot("infantry_kit_missing")
+      end
       active
     end
 
@@ -1488,10 +1507,23 @@ module Erep
       :failure
     end
 
+    # Drops the Ferrum CDP connection but leaves Chrome running so the next run
+    # can reattach with the live session (cf_clearance + login cookies intact).
+    # Use kill! for a hard teardown.
     def quit
+      # Ferrum's quit only SIGTERMs the process it spawned itself; we connected
+      # via url so this just closes the WS — Chrome keeps running.
       browser.quit rescue nil
-      Process.kill("TERM", @chrome_pid) rescue nil
-      Process.wait(@chrome_pid) rescue nil
+    end
+
+    def kill!
+      browser.quit rescue nil
+      if @chrome_pid
+        Process.kill("TERM", @chrome_pid) rescue nil
+        Process.wait(@chrome_pid) rescue nil
+      else
+        chrome_pids.each { |pid| Process.kill("TERM", pid.to_i) rescue nil }
+      end
     end
 
     private
@@ -1509,23 +1541,38 @@ module Erep
         return :logged_in
       end
 
-      # Detect Cloudflare challenge early — no point waiting 30s for a login form
-      if cloudflare_challenge_present?
-        log "Cloudflare challenge detected immediately"
-        return nil
-      end
+      # CF interstitial often takes 10-60s to self-resolve; don't bail on it.
+      # Only re-seed if it persists past CF_RESOLVE_TIMEOUT.
+      cf_resolve_timeout = 25
+      login_wait_timeout = 15
+      deadline = Time.now + cf_resolve_timeout
+      logged_cf_wait = false
 
       log "Waiting for login form..."
-      3.times do |i|
-        sleep 5
+      attempt = 0
+      while Time.now < deadline
+        sleep 3
         return :logged_in if logged_in?
         email_field = browser.at_css("#citizen_email")
         return email_field if email_field
-        return nil if cloudflare_challenge_present?
-        log "Login form not ready, waiting... (attempt #{i + 1}/3)"
-        dump_login_state("retry_#{i + 1}") if i == 2
+
+        if cloudflare_challenge_present?
+          unless logged_cf_wait
+            log "Cloudflare interstitial detected — waiting for self-resolve..."
+            logged_cf_wait = true
+          end
+          next
+        end
+
+        # No CF, no login form, not logged in — the login form should appear quickly
+        # once CF clears. Cap this branch to login_wait_timeout.
+        attempt += 1
+        log "Login form not ready, waiting... (attempt #{attempt})"
+        dump_login_state("retry_#{attempt}") if attempt == 3
+        break if attempt * 3 >= login_wait_timeout
       end
 
+      dump_login_state("timeout")
       nil
     end
 
@@ -1812,6 +1859,26 @@ module Erep
       log "WARNING: cf_clearance not confirmed after 3 attempts, proceeding anyway"
     end
 
+    def attach_to_existing_chrome
+      return false unless cdp_port_alive?
+      return false if chrome_pids.empty?
+
+      @chrome_pid = nil # we did not spawn this one
+      @browser = Ferrum::Browser.new(url: "http://127.0.0.1:#{CDP_PORT}", timeout: 30)
+      close_extra_tabs
+      true
+    rescue StandardError => e
+      log "Failed to attach to existing Chrome: #{e.message}"
+      @browser = nil
+      false
+    end
+
+    def cdp_port_alive?
+      Net::HTTP.get_response(URI("http://127.0.0.1:#{CDP_PORT}/json/version")).is_a?(Net::HTTPSuccess)
+    rescue StandardError
+      false
+    end
+
     def launch_chrome_with_cdp
       ensure_profile_unlocked
       log "Phase 2: Launching Chrome with CDP..."
@@ -1972,15 +2039,53 @@ module Erep
       JS
     end
 
+    def extract_citizen_id
+      browser.evaluate(<<~JS) rescue nil
+        (function() {
+          // 1. SERVER_DATA — try multiple shapes
+          var sd = typeof SERVER_DATA !== 'undefined' ? SERVER_DATA : null;
+          if (!sd && typeof erepublik !== 'undefined') sd = erepublik.settings;
+          if (sd) {
+            if (sd.citizenId) return sd.citizenId;
+            if (sd.citizen_id) return sd.citizen_id;
+            if (sd.citizen && sd.citizen.citizenId) return sd.citizen.citizenId;
+            if (sd.citizen && sd.citizen.id) return sd.citizen.id;
+            if (sd.user && sd.user.citizenId) return sd.user.citizenId;
+          }
+
+          // 2. Header avatar / profile link: /en/citizen/profile/<id>
+          var links = document.querySelectorAll('a[href*="/citizen/profile/"]');
+          for (var i = 0; i < links.length; i++) {
+            var m = links[i].getAttribute('href').match(/\\/citizen\\/profile\\/(\\d+)/);
+            if (m) return parseInt(m[1], 10);
+          }
+
+          // 3. Inline JSON fallback
+          var html = document.body.innerHTML;
+          var m2 = html.match(/"citizenId"\\s*:\\s*(\\d+)/);
+          if (m2) return parseInt(m2[1], 10);
+
+          return null;
+        })()
+      JS
+    end
+
     def cloudflare_challenge_present?
       browser.evaluate(<<~JS) rescue false
         (function() {
           // Turnstile iframe or Cloudflare challenge markers
           if (document.querySelector('iframe[src*="challenges.cloudflare"]')) return true;
           if (document.querySelector('#challenge-running, #challenge-stage')) return true;
-          // Cloudflare "Just a moment" / "Verifying" page
+          // Cloudflare "Just a moment" / "Verifying" page — localized titles
           var title = document.title.toLowerCase();
-          if (title.includes('just a moment') || title.includes('attention required')) return true;
+          var markers = [
+            'just a moment',     // en
+            'attention required',// en
+            'зачекайте'          // uk: "Трохи зачекайте"
+          ];
+          for (var i = 0; i < markers.length; i++) {
+            if (title.indexOf(markers[i]) !== -1) return true;
+          }
           return false;
         })()
       JS

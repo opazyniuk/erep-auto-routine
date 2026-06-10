@@ -4,3 +4,7 @@ source "https://rubygems.org"
 
 gem "ferrum"
 gem "dotenv"
+
+group :test do
+  gem "minitest"
+end
