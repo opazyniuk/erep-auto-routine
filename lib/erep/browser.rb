@@ -1165,28 +1165,18 @@ module Erep
       raise FightError, "No CSRF token for deploy" unless token
 
       # Step 1: Get deploy inventory
-      browser.evaluate(<<~JS)
-        (async () => {
-          try {
-            var formData = new URLSearchParams();
-            formData.append('_token', '#{token}');
-            formData.append('battleId', '#{battle_id}');
-            formData.append('sideCountryId', '#{side_country_id}');
-            formData.append('battleZoneId', '#{zone_id}');
-            var resp = await fetch('/en/military/fightDeploy-getInventory', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-              body: formData.toString()
-            });
-            var data = await resp.json();
-            window.__deployInventory = JSON.stringify(data);
-          } catch(e) { window.__deployInventory = JSON.stringify({error: e.message}); }
-        })()
-      JS
-      sleep 2
-      inv_json = browser.evaluate("window.__deployInventory") rescue nil
-      inventory = JSON.parse(inv_json || "{}")
+      inventory = fetch_deploy_inventory(token: token, battle_id: battle_id,
+                                         side_country_id: side_country_id, zone_id: zone_id)
+
+      # A captcha-gated response carries no energy fields — that's a verification
+      # gate, NOT an empty pool. Solve and re-fetch once before trusting the numbers;
+      # otherwise poolEnergy reads nil→0 and we skip a beatable rival (see 917941).
+      if inventory["captcha"] || !inventory.key?("poolEnergy")
+        log "Deploy inventory gated (captcha/missing fields), verifying + retrying..."
+        handle_verification
+        inventory = fetch_deploy_inventory(token: token, battle_id: battle_id,
+                                           side_country_id: side_country_id, zone_id: zone_id)
+      end
 
       if inventory["error"] == true
         log "Deploy inventory error: #{inventory.inspect}"
@@ -1205,10 +1195,11 @@ module Erep
         return nil
       end
 
-      # Handle captcha if present
-      if inventory["captcha"] && inventory["captcha"]["canVerifyLater"].to_i <= 0
-        log "Captcha required, attempting verification..."
-        handle_verification
+      # Still gated after verification? Bail with an honest message instead of
+      # misreporting a missing inventory as an empty energy pool.
+      unless inventory.key?("poolEnergy")
+        log "Deploy inventory still gated after verification (no energy fields), skipping"
+        return nil
       end
 
       # Check if enough energy is available (pool + recoverable)
@@ -1299,6 +1290,31 @@ module Erep
       end
 
       result
+    end
+
+    def fetch_deploy_inventory(token:, battle_id:, side_country_id:, zone_id:)
+      browser.evaluate(<<~JS)
+        (async () => {
+          try {
+            var formData = new URLSearchParams();
+            formData.append('_token', '#{token}');
+            formData.append('battleId', '#{battle_id}');
+            formData.append('sideCountryId', '#{side_country_id}');
+            formData.append('battleZoneId', '#{zone_id}');
+            var resp = await fetch('/en/military/fightDeploy-getInventory', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+              body: formData.toString()
+            });
+            var data = await resp.json();
+            window.__deployInventory = JSON.stringify(data);
+          } catch(e) { window.__deployInventory = JSON.stringify({error: e.message}); }
+        })()
+      JS
+      sleep 2
+      inv_json = browser.evaluate("window.__deployInventory") rescue nil
+      JSON.parse(inv_json || "{}")
     end
 
     def fetch_deploy_report(deployment_id)
