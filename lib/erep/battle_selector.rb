@@ -1,13 +1,22 @@
 # frozen_string_literal: true
 
-require_relative "../../config/countries"
+require_relative "config"
 
 module Erep
   class BattleSelector
     ENEMIES = Erep::Config::ENEMIES
     ENEMY_PERMALINKS = Erep::Config::ENEMY_PERMALINKS
+    ENEMY_CITIZEN_IDS = Erep::Config::ENEMY_CITIZEN_IDS
     FRIENDS = Erep::Config::FRIENDS
+    PRIORITY = Erep::Config::PRIORITY
     DIV_KEY = "div" # division key in campaign JSON
+
+    # A round fighter counts as an enemy when their citizenship is hostile OR
+    # their citizen ID is individually blacklisted (ENEMY_CITIZEN_IDS).
+    def self.enemy_fighter?(fighter)
+      ENEMY_PERMALINKS.include?(fighter[:citizenship_permalink]) ||
+        ENEMY_CITIZEN_IDS.include?(fighter[:citizen_id].to_i)
+    end
 
     def initialize(campaigns_json)
       @campaigns = campaigns_json
@@ -16,10 +25,21 @@ module Erep
     def select_targets
       battles = Array(@campaigns["battles"]&.values || @campaigns)
 
-      battles.filter_map { |battle| evaluate(battle) }
+      targets = battles.filter_map { |battle| evaluate(battle) }
+      prioritize(targets)
     end
 
     private
+
+    # Battles involving a PRIORITY country (e.g. Ukraine) are returned first so
+    # they get fuel/energy before the budget runs out. Order within each tier is
+    # preserved; empty PRIORITY leaves order unchanged.
+    def prioritize(targets)
+      priority, rest = targets.partition do |target|
+        target[:sides].any? { |side| PRIORITY.include?(side[:country_id].to_i) }
+      end
+      priority + rest
+    end
 
     def evaluate(battle)
       invader_id = battle.dig("inv", "id") || battle["invaderId"]

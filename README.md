@@ -109,11 +109,16 @@ Stack:
 Setup:
 
 ```bash
-cp .env.example .env  # fill in EREP_EMAIL, EREP_PASSWORD, GEMINI_API_KEY
+cp .env.example .env                          # fill in EREP_EMAIL, EREP_PASSWORD, GEMINI_API_KEY
+cp config/countries.example.yml config/countries.yml  # fill in enemy/friend/priority IDs
 mise install
 bundle install
 bin/train_once         # manual smoke test
 ```
+
+`config/countries.yml` (gitignored) drives battle selection — which countries
+to fight for, which to skip, and individual enemy citizen IDs. Each field is
+documented in `config/countries.example.yml`.
 
 Schedule via `launchd` (macOS): write a plist at
 `~/Library/LaunchAgents/com.erep.trainer.plist` pointing at a shell wrapper

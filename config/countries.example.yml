@@ -1,0 +1,25 @@
+# Country/citizen IDs that drive battle selection.
+# Copy this file to config/countries.yml (gitignored) and fill in real IDs.
+#
+# enemies            Map of country ID => permalink for countries the bot must
+#                    NOT fight against. Battles where any of these is invader OR
+#                    defender are skipped entirely (BattleSelector#involves_enemy?,
+#                    matched by ID). The permalink half drives RIVAL mode: the
+#                    battle-console fighterData exposes only country_permalink (a
+#                    string, not an ID), so an enemy citizen on a Div 3 round is
+#                    matched by permalink. Permalinks are case-sensitive — must
+#                    match eRepublik exactly (e.g. Russia).
+# enemy_citizen_ids  Individual citizen IDs (e.g. 1619581 from
+#                    /en/citizen/profile/1619581) treated as enemies regardless
+#                    of their citizenship (BattleSelector.enemy_fighter?).
+# friends            Country IDs the bot is willing to fight for. A battle must
+#                    involve at least one on either side
+#                    (BattleSelector#involves_friend?).
+# priority           Subset of `friends` fought FIRST, ahead of all others, so
+#                    they get fuel/energy before the budget runs out
+#                    (BattleSelector#prioritize). Empty = no prioritization.
+
+enemies: {}
+enemy_citizen_ids: []
+friends: []
+priority: []
