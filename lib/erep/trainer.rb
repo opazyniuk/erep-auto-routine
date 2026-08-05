@@ -2,6 +2,7 @@
 
 require "date"
 require_relative "browser"
+require_relative "logger"
 
 module Erep
   class Trainer
@@ -10,10 +11,11 @@ module Erep
     def initialize(email:, password:)
       @email = email
       @password = password
+      @logger = Logger.new(LOG_FILE)
     end
 
     def run
-      log separator
+      @logger.separator
       log "Starting daily routine"
       browser = Browser.new(log_file: LOG_FILE)
 
@@ -34,12 +36,12 @@ module Erep
       gold_result = safe_step("Daily gold buy") { browser.buy_gold }
 
       log "Done | train=#{train_result} pro_contract=#{pro_contract_result} vip=#{vip_result} energy_bars=#{energy_bars_result} gold=#{gold_result}"
-      log separator
+      @logger.separator
       train_result != :error
     rescue => e
       log "FAILED | #{e.message}"
       log e.backtrace.first(5).join("\n")
-      log separator
+      @logger.separator
       false
     ensure
       browser&.quit
@@ -61,14 +63,8 @@ module Erep
       (last_day - today).to_i < 3
     end
 
-    def separator
-      "=" * 60
-    end
-
     def log(msg)
-      line = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] #{msg}"
-      LOG_FILE.puts(line)
-      LOG_FILE.flush
+      @logger.log(msg)
     end
   end
 end

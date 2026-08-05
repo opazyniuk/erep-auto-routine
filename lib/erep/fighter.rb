@@ -2,6 +2,7 @@
 
 require "date"
 require_relative "browser"
+require_relative "logger"
 require_relative "fuel_budget"
 require_relative "battle_selector"
 
@@ -13,28 +14,27 @@ module Erep
     def initialize(email:, password:)
       @email = email
       @password = password
+      @logger = Logger.new(LOG_FILE)
     end
 
     def run
-      # Truncate log file at start of each session — keep only current run
+      # Keep only the current run in the log
       File.truncate(LOG_PATH, 0) if File.exist?(LOG_PATH)
       LOG_FILE.seek(0)
 
-      log separator
+      @logger.separator
       log "Starting fight session"
       @browser = Browser.new(log_file: LOG_FILE)
 
       @browser.login(@email, @password)
-
       @browser.handle_verification
 
-      # 1. Safety gate: Infantry Kit must be active (prevents XP gain)
+      # Safety gate: fighting without the Infantry Kit gains XP
       unless @browser.infantry_kit_active?
         log "ABORT: Infantry Kit not active — fighting would gain XP"
         return :no_infantry_kit
       end
 
-      # 2. Read fuel budget
       fuel = @browser.read_fuel_balance
       unless fuel
         log "ABORT: Could not read fuel balance"
@@ -47,23 +47,18 @@ module Erep
         return :no_fuel
       end
 
-      # 2b. Record XP before fighting to detect accidental XP gain
+      # Baseline XP so we can detect accidental XP gain mid-session
       account = @browser.fetch_account_info
       @xp_before = account&.dig("xp") || account&.dig("citizenXp")
       log "XP before fighting: #{@xp_before}" if @xp_before
 
-      # 3. Handle any pending account verification
       unless @browser.handle_verification
         log "ABORT: Account verification required and could not be resolved"
         return :verification_blocked
       end
 
-      # 4. Fetch campaigns
       campaigns = @browser.fetch_campaigns
-
-      # 5. Select eligible battles
-      selector = BattleSelector.new(campaigns)
-      targets = selector.select_targets
+      targets = BattleSelector.new(campaigns).select_targets
       log "Found #{targets.size} eligible battle(s)"
 
       if targets.empty?
@@ -72,7 +67,31 @@ module Erep
         return :no_battles
       end
 
-      # 6. Fight loop
+      fight_targets(targets, budget)
+
+      collect_rewards
+      safe_step("Travel home") { @browser.travel_home }
+
+      log "Fight session complete"
+      @logger.separator
+      true
+    rescue => e
+      log "FAILED | #{e.message}"
+      log e.backtrace.first(5).join("\n")
+      @logger.separator
+      false
+    ensure
+      @browser&.quit
+    end
+
+    private
+
+    # Conservative damage-per-energy estimate (q7 weapons + boosters)
+    DAMAGE_PER_ENERGY = 80_000
+    RIVAL_MAX_DAMAGE_PER_SIDE = 50_000_000
+    ROUND_DIVIDER = "-" * 60
+
+    def fight_targets(targets, budget)
       targets.each do |target|
         unless budget.can_fight?
           log "Fuel budget exhausted"
@@ -85,168 +104,164 @@ module Erep
           break
         end
 
-        fight_battle(target, budget)
+        # A transient CDP/Ferrum timeout on one battle's deploy must not kill the
+        # whole session — log it and move on to the next battle (see battle 924445,
+        # winning-side deploy timing out at 30s and aborting the entire run).
+        begin
+          fight_battle(target, budget)
+        rescue => e
+          log "Battle #{target[:battle_id]} errored mid-fight (#{e.message}) — skipping to next"
+        end
 
-        # Handle captcha if it appeared during fighting
         unless @browser.handle_verification
           log "Captcha appeared mid-fight and could not be resolved, stopping"
           break
         end
 
-        # Check XP didn't increase (would mean Infantry Kit failed)
-        if @xp_before
-          account = @browser.fetch_account_info
-          xp_now = account&.dig("xp") || account&.dig("citizenXp")
-          if xp_now && xp_now > @xp_before
-            log "SAFETY ABORT: XP increased from #{@xp_before} to #{xp_now} — Infantry Kit may have failed"
-            break
-          end
-        end
+        break if xp_gained?
       end
-
-      # 6. Collect rewards
-      collect_rewards
-
-      # 7. Return to home location
-      safe_step("Travel home") { @browser.travel_home }
-
-      log "Fight session complete"
-      log separator
-      true
-    rescue => e
-      log "FAILED | #{e.message}"
-      log e.backtrace.first(5).join("\n")
-      log separator
-      false
-    ensure
-      @browser&.quit
     end
 
-    private
-
-    # Conservative damage-per-energy estimate (q7 weapons + boosters)
-    DAMAGE_PER_ENERGY = 80_000
-    RIVAL_MAX_DAMAGE_PER_SIDE = 50_000_000
-
     def fight_battle(target, budget)
-      battle_id = target[:battle_id]
-      zone_id = target[:zone_id]
-      sides = target[:sides]
+      battle_id, zone_id, sides = target.values_at(:battle_id, :zone_id, :sides)
 
-      log "------------------------------------------------------------"
+      log ROUND_DIVIDER
       log "Fighting battle #{battle_id} (zone #{zone_id})"
 
-      # Navigate to battle page
       @browser.go_to("#{Browser::BASE_URL}/en/military/battlefield/#{battle_id}")
       sleep 3
 
-      # Check if battle/round is still active before deploying
       unless @browser.battle_zone_active?(zone_id)
         log "Battle zone #{zone_id} no longer active, skipping"
         return
       end
 
-      # Analyze fighters in round
-      round_fighters = @browser.analyze_round_fighters(battle_id, zone_id)
+      enemy_fighters = detect_enemy_fighters(battle_id, zone_id)
+      return if enemy_fighters == :skip
 
-      if round_fighters.any?
-        enemy_fighters = round_fighters.select { |f| BattleSelector.enemy_fighter?(f) }
+      losing, winning = resolve_sides(sides)
+      activate_booster_once
 
-        if enemy_fighters.empty?
-          log "Round occupied by non-enemy, skipping battle #{battle_id}"
-          return
-        end
+      plan = energy_plan(enemy_fighters, losing, winning)
 
-        log "RIVAL MODE: Enemy citizen(s) detected — #{enemy_fighters.map { |f| "#{f[:name]} (#{f[:damage]} dmg)" }.join(', ')}"
-        rival_mode = true
-        max_enemy_damage = enemy_fighters.map { |f| f[:damage] }.max
+      energy = @browser.read_energy
+      unless energy && energy[:current] >= plan[:min_required]
+        log "Not enough energy (#{energy&.dig(:current) || 'unknown'}/#{plan[:min_required]}), skipping battle"
+        return
       end
 
-      # Determine winning/losing by overall battle score (campaign points), not round wall
-      battle_score = @browser.read_battle_score
-      if battle_score && battle_score[:invader_points] && battle_score[:defender_points]
+      deploy_both_sides(battle_id, zone_id, losing, winning, plan, budget)
+    end
+
+    # Enemy fighters occupying the round ([] when clear or empty), or :skip when a
+    # non-enemy already holds it.
+    def detect_enemy_fighters(battle_id, zone_id)
+      round_fighters = @browser.analyze_round_fighters(battle_id, zone_id)
+      return [] if round_fighters.empty?
+
+      enemies = round_fighters.select { |f| BattleSelector.enemy_fighter?(f) }
+      if enemies.empty?
+        log "Round occupied by non-enemy, skipping battle #{battle_id}"
+        return :skip
+      end
+
+      log "RIVAL MODE: Enemy citizen(s) detected — #{enemies.map { |f| "#{f[:name]} (#{f[:damage]} dmg)" }.join(', ')}"
+      enemies
+    end
+
+    # Assigns battle_points from campaign score (falling back to the round wall)
+    # and returns [losing_side, winning_side].
+    def resolve_sides(sides)
+      score = @browser.read_battle_score
+      if score && score[:invader_points] && score[:defender_points]
         sides.each do |s|
           case s[:role]
-          when :invader then s[:battle_points] = battle_score[:invader_points].to_i
-          when :defender then s[:battle_points] = battle_score[:defender_points].to_i
+          when :invader then s[:battle_points] = score[:invader_points].to_i
+          when :defender then s[:battle_points] = score[:defender_points].to_i
           end
         end
         log "Battle score: #{sides.map { |s| "#{s[:country_id]}(#{s[:role]})=#{s[:battle_points]}pts" }.join(' vs ')}"
       end
 
-      # Fallback to round wall % if battle score unavailable
-      unless sides.all? { |s| s[:battle_points] }
-        live_wall = @browser.read_wall_state
-        if live_wall
-          log "Wall fallback: #{live_wall[:left_country]} #{live_wall[:left_pct]}% vs #{live_wall[:right_country]} #{live_wall[:right_pct]}%"
-          sides.each do |s|
-            s[:battle_points] ||= if s[:country_id].to_s == live_wall[:left_country].to_s
-                                    live_wall[:left_pct]
-                                  elsif s[:country_id].to_s == live_wall[:right_country].to_s
-                                    live_wall[:right_pct]
-                                  else
-                                    50
-                                  end
-          end
-        end
+      apply_wall_fallback(sides) unless sides.all? { |s| s[:battle_points] }
+
+      sides.sort_by { |s| [s[:battle_points] || 50, s[:role] == :defender ? 1 : 0] }
+    end
+
+    def apply_wall_fallback(sides)
+      wall = @browser.read_wall_state
+      return unless wall
+
+      log "Wall fallback: #{wall[:left_country]} #{wall[:left_pct]}% vs #{wall[:right_country]} #{wall[:right_pct]}%"
+      sides.each do |s|
+        s[:battle_points] ||= if s[:country_id].to_s == wall[:left_country].to_s
+                                wall[:left_pct]
+                              elsif s[:country_id].to_s == wall[:right_country].to_s
+                                wall[:right_pct]
+                              else
+                                50
+                              end
       end
+    end
 
-      losing, winning = sides.sort_by { |s| [s[:battle_points] || 50, s[:role] == :defender ? 1 : 0] }
+    def activate_booster_once
+      return if @booster_checked
 
-      # Ensure 50% damage booster is active before first deploy
-      unless @booster_checked
-        @browser.ensure_damage_booster
-        @booster_checked = true
-      end
+      @browser.ensure_damage_booster
+      @booster_checked = true
+    end
 
-      # Decide energy per side
-      if rival_mode
-        max_energy_cap = (RIVAL_MAX_DAMAGE_PER_SIDE / DAMAGE_PER_ENERGY.to_f).ceil
+    # Energy to spend per side. Default 40/160 split; in rival mode, enough to beat
+    # each side's strongest enemy by 30%, floored at 40/160 and capped per side.
+    def energy_plan(enemy_fighters, losing, winning)
+      return { losing_energy: 40, winning_energy: 160, min_required: 200 } if enemy_fighters.empty?
 
-        # Calculate per-side: beat enemy damage on that side with 30% buffer
-        losing_enemy_dmg = enemy_fighters.select { |f| f[:side_country_id] == losing[:country_id].to_i }.map { |f| f[:damage] }.max || 0
-        winning_enemy_dmg = enemy_fighters.select { |f| f[:side_country_id] == winning[:country_id].to_i }.map { |f| f[:damage] }.max || 0
+      cap = (RIVAL_MAX_DAMAGE_PER_SIDE / DAMAGE_PER_ENERGY.to_f).ceil
+      losing_dmg = max_enemy_damage(enemy_fighters, losing)
+      winning_dmg = max_enemy_damage(enemy_fighters, winning)
+      losing_energy = [[(losing_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 40].max, cap].min
+      winning_energy = [[(winning_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 160].max, cap].min
+      min_required = losing_energy + winning_energy
+      log "Rival energy: losing=#{losing_energy} (vs #{losing_dmg} dmg) + winning=#{winning_energy} (vs #{winning_dmg} dmg) = #{min_required} total, cap #{RIVAL_MAX_DAMAGE_PER_SIDE / 1_000_000}M/side"
+      { losing_energy: losing_energy, winning_energy: winning_energy, min_required: min_required }
+    end
 
-        losing_energy = [[(losing_enemy_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 40].max, max_energy_cap].min
-        winning_energy = [[(winning_enemy_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 160].max, max_energy_cap].min
+    def max_enemy_damage(enemy_fighters, side)
+      enemy_fighters.select { |f| f[:side_country_id] == side[:country_id].to_i }.map { |f| f[:damage] }.max || 0
+    end
 
-        min_required = losing_energy + winning_energy
-        log "Rival energy: losing=#{losing_energy} (vs #{losing_enemy_dmg} dmg) + winning=#{winning_energy} (vs #{winning_enemy_dmg} dmg) = #{min_required} total, cap #{RIVAL_MAX_DAMAGE_PER_SIDE / 1_000_000}M/side"
-      else
-        losing_energy = 40
-        winning_energy = 160
-        min_required = 200
-      end
-
-      # Check energy from page header
-      energy = @browser.read_energy
-      unless energy && energy[:current] >= min_required
-        log "Not enough energy (#{energy&.dig(:current) || 'unknown'}/#{min_required}), skipping battle"
-        return
-      end
-
-      # Deploy on losing side
-      log "Deploying on losing side (#{losing[:country_id]}, #{losing[:wall_pct]}%) — #{losing_energy} energy"
+    def deploy_both_sides(battle_id, zone_id, losing, winning, plan, budget)
+      log "Deploying on losing side (#{losing[:country_id]}, #{losing[:wall_pct]}%) — #{plan[:losing_energy]} energy"
       @browser.switch_side(battle_id: battle_id, side_country_id: losing[:country_id], zone_id: zone_id)
       result1 = @browser.deploy(battle_id: battle_id, zone_id: zone_id,
                                 side_country_id: losing[:country_id],
-                                weapon_quality: 7, total_energy: losing_energy)
+                                weapon_quality: 7, total_energy: plan[:losing_energy])
 
       unless result1
         log "Losing side deploy failed, skipping winning side"
         return
       end
 
-      # Deploy on winning side
-      log "Deploying on winning side (#{winning[:country_id]}, #{winning[:wall_pct]}%) — #{winning_energy} energy"
+      log "Deploying on winning side (#{winning[:country_id]}, #{winning[:wall_pct]}%) — #{plan[:winning_energy]} energy"
       @browser.switch_side(battle_id: battle_id, side_country_id: winning[:country_id], zone_id: zone_id)
       result2 = @browser.deploy(battle_id: battle_id, zone_id: zone_id,
                                 side_country_id: winning[:country_id],
-                                weapon_quality: 7, total_energy: winning_energy)
+                                weapon_quality: 7, total_energy: plan[:winning_energy])
 
       budget.consume(1) if result1 || result2
-
       log "Battle #{battle_id} done (losing=#{result1 ? 'OK' : 'FAIL'}, winning=#{result2 ? 'OK' : 'FAIL'})"
+    end
+
+    # True (and logs) when XP rose since baseline — the Infantry Kit likely lapsed.
+    def xp_gained?
+      return false unless @xp_before
+
+      account = @browser.fetch_account_info
+      xp_now = account&.dig("xp") || account&.dig("citizenXp")
+      return false unless xp_now && xp_now > @xp_before
+
+      log "SAFETY ABORT: XP increased from #{@xp_before} to #{xp_now} — Infantry Kit may have failed"
+      true
     end
 
     def collect_rewards
@@ -262,14 +277,8 @@ module Erep
       :error
     end
 
-    def separator
-      "=" * 60
-    end
-
     def log(msg)
-      line = "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] #{msg}"
-      LOG_FILE.puts(line)
-      LOG_FILE.flush
+      @logger.log(msg)
     end
   end
 end

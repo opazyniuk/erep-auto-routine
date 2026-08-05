@@ -22,24 +22,28 @@ end
 
 puts "[1] Booting Browser..."
 b = Erep::Browser.new
-pids_before = b.send(:chrome_pids)
+session = b.instance_variable_get(:@session)
+chrome = session.instance_variable_get(:@chrome)
+cloudflare = session.instance_variable_get(:@cloudflare)
+
+pids_before = chrome.send(:chrome_pids)
 port_before = port_owner
 assert !pids_before.empty?, "chrome processes alive after initial boot"
 assert !port_before.empty?, "port 9232 bound after initial boot"
 puts "    chrome_pids=#{pids_before.inspect} port_owner=#{port_before.inspect}"
 
-puts "[2] Simulating CF retry: browser.quit + re-seed + relaunch..."
+puts "[2] Simulating CF retry: quit + re-seed..."
 b.browser.quit rescue nil
-b.send(:seed_cloudflare_clearance)
+chrome.seed_clearance(cloudflare)
 
 # After seeding, kill_stale_chrome should have cleared everything
-mid = b.send(:chrome_pids)
+mid = chrome.send(:chrome_pids)
 puts "    chrome_pids after seed cleanup=#{mid.inspect}"
-assert mid.empty?, "no chrome left after seed_cloudflare_clearance"
-assert port_owner.empty?, "port 9232 released after seed_cloudflare_clearance"
+assert mid.empty?, "no chrome left after seed_clearance"
+assert port_owner.empty?, "port 9232 released after seed_clearance"
 
 puts "[3] Relaunching CDP Chrome..."
-b.send(:launch_chrome_with_cdp)
+session.instance_variable_set(:@browser, chrome.launch)
 port_after = port_owner
 puts "    new port owner=#{port_after.inspect}"
 assert !port_after.empty?, "port 9232 bound by fresh Chrome"
@@ -51,7 +55,7 @@ puts "    go_to returned in #{(Time.now - t0).round(2)}s — CDP healthy"
 
 puts "[5] Cleanup..."
 b.browser.quit rescue nil
-b.send(:kill_stale_chrome)
+chrome.kill_stale_chrome
 assert port_owner.empty?, "port 9232 released after cleanup"
 
 puts "\nALL CHECKS PASSED"
