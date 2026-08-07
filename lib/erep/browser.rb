@@ -43,7 +43,8 @@ module Erep
     def_delegators :@boosters, :ensure_damage_booster
     def_delegators :@battlefield, :battle_zone_active?, :read_battle_score, :read_wall_state,
                    :fetch_campaigns, :fetch_battle_stats, :analyze_round_fighters,
-                   :fetch_account_info, :infantry_kit_active?, :read_fuel_balance, :read_energy
+                   :fetch_account_info, :infantry_kit_active?, :read_fuel_balance, :read_energy,
+                   :round_state
     def_delegators :@deployment, :deploy, :switch_side
     def_delegators :@challenges, :collect_daily_challenge, :collect_weekly_challenge
     def_delegators :@travel, :travel_home

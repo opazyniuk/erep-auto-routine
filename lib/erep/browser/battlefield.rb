@@ -275,6 +275,34 @@ module Erep
         JSON.parse(energy, symbolize_names: true)
       end
 
+      # Live round lifecycle read from the battlefield page, used to skip a round
+      # we can't deploy into (deploy POST into a resolved/transitioning zone returns
+      # "Battle zone unavailable"). Only two fields are trustworthy here:
+      #   zoneStarted  — false between rounds (the transition window where deploys fail)
+      #   battleFinished — the whole battle is over
+      # We deliberately do NOT use #battle_countdown: measured twice 6s apart it counts
+      # UP and equals zoneElapsedTime, i.e. it's elapsed round time, not remaining —
+      # useless as an "about to close" signal. Nor battle_close_to_finish: it stayed 0
+      # on a round with only 3:32 elapsed-to-cap, so it tracks the campaign nearing a
+      # decision, not the round. Returns {started:, finished:} or nil without SERVER_DATA.
+      def round_state
+        state = @session.evaluate(<<~JS)
+          (function() {
+            var sd = (typeof SERVER_DATA !== 'undefined') ? SERVER_DATA : null;
+            if (!sd) return null;
+            return JSON.stringify({
+              started: sd.zoneStarted === true,
+              finished: sd.battleFinished == 1
+            });
+          })()
+        JS
+        return nil unless state
+
+        JSON.parse(state, symbolize_names: true)
+      rescue StandardError
+        nil
+      end
+
       private
 
       def log(msg)

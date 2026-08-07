@@ -150,7 +150,25 @@ module Erep
         return
       end
 
+      return if round_closing?(battle_id)
+
       deploy_both_sides(battle_id, zone_id, losing, winning, plan, budget)
+    end
+
+    # True (and logs) when the round isn't in a deployable state — the battle is
+    # finished, or we're between rounds (zone not started), which is the transition
+    # window where a deploy POST comes back "Battle zone unavailable". Nil state
+    # (page didn't expose SERVER_DATA) is treated as deployable so we still try.
+    def round_closing?(battle_id)
+      state = @browser.round_state
+      return false unless state
+
+      if state[:finished] || state[:started] == false
+        log "Round finished/between rounds, skipping battle #{battle_id}"
+        return true
+      end
+
+      false
     end
 
     # Enemy fighters occupying the round ([] when clear or empty), or :skip when a
