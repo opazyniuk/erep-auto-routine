@@ -90,6 +90,11 @@ module Erep
     # Conservative damage-per-energy estimate (q7 weapons + boosters)
     DAMAGE_PER_ENERGY = 80_000
     RIVAL_MAX_DAMAGE_PER_SIDE = 50_000_000
+    # A deploy consumes a random 10-40 energy per hit (the deploy inventory reports
+    # minEnergy: 10) and stops once what is left is smaller than the next hit, so a
+    # request lands anywhere from the full amount to 30 short.
+    MIN_HIT_ENERGY = 10
+    MAX_HIT_ENERGY = 40
     ROUND_DIVIDER = "-" * 60
 
     def fight_targets(targets, budget)
@@ -242,14 +247,26 @@ module Erep
     def energy_plan(enemy_fighters, losing, winning)
       return { losing_energy: 40, winning_energy: 160, min_required: 200 } if enemy_fighters.empty?
 
-      cap = (RIVAL_MAX_DAMAGE_PER_SIDE / DAMAGE_PER_ENERGY.to_f).ceil
+      cap = whole_hits(RIVAL_MAX_DAMAGE_PER_SIDE / DAMAGE_PER_ENERGY.to_f, :floor)
       losing_dmg = max_enemy_damage(enemy_fighters, losing)
       winning_dmg = max_enemy_damage(enemy_fighters, winning)
-      losing_energy = [[(losing_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 40].max, cap].min
-      winning_energy = [[(winning_dmg * 1.3 / DAMAGE_PER_ENERGY).ceil, 160].max, cap].min
+      losing_energy = [[rival_energy(losing_dmg), 40].max, cap].min
+      winning_energy = [[rival_energy(winning_dmg), 160].max, cap].min
       min_required = losing_energy + winning_energy
       log "Rival energy: losing=#{losing_energy} (vs #{losing_dmg} dmg) + winning=#{winning_energy} (vs #{winning_dmg} dmg) = #{min_required} total, cap #{RIVAL_MAX_DAMAGE_PER_SIDE / 1_000_000}M/side"
       { losing_energy: losing_energy, winning_energy: winning_energy, min_required: min_required }
+    end
+
+    # Round the rival target up to a whole hit step — a request of 82 can only ever
+    # land 80 — then add a full max-hit of margin so the target is still cleared when
+    # the tail hit doesn't fit in what's left. The per-side cap rounds down instead,
+    # so the margin can never push us over it.
+    def rival_energy(rival_damage)
+      whole_hits(rival_damage * 1.3 / DAMAGE_PER_ENERGY, :ceil) + MAX_HIT_ENERGY
+    end
+
+    def whole_hits(energy, rounding)
+      (energy / MIN_HIT_ENERGY.to_f).public_send(rounding) * MIN_HIT_ENERGY
     end
 
     def max_enemy_damage(enemy_fighters, side)
