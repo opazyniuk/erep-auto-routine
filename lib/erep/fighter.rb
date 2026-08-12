@@ -59,7 +59,8 @@ module Erep
 
       campaigns = @browser.fetch_campaigns
       targets = BattleSelector.new(campaigns).select_targets
-      log "Found #{targets.size} eligible battle(s)"
+      allied, neutral = targets.partition { |target| target[:friendly] }
+      log "Found #{targets.size} eligible battle(s): #{allied.size} allied, #{neutral.size} neutral"
 
       if targets.empty?
         log "No eligible battles found"
@@ -92,7 +93,14 @@ module Erep
     ROUND_DIVIDER = "-" * 60
 
     def fight_targets(targets, budget)
+      neutral_tier_announced = false
+
       targets.each do |target|
+        if !target[:friendly] && !neutral_tier_announced
+          log "Allied battles exhausted — falling back to neutral battles"
+          neutral_tier_announced = true
+        end
+
         unless budget.can_fight?
           log "Fuel budget exhausted"
           break

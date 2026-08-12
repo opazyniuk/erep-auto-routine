@@ -31,14 +31,20 @@ module Erep
 
     private
 
-    # Battles involving a PRIORITY country (e.g. Ukraine) are returned first so
-    # they get fuel/energy before the budget runs out. Order within each tier is
-    # preserved; empty PRIORITY leaves order unchanged.
+    # Three tiers, in order: PRIORITY countries (e.g. Ukraine), remaining allied
+    # battles, then neutral ones — battles where neither side is a friend but
+    # none is an enemy either. Neutrals are a fallback: allied rounds are mostly
+    # already occupied by allies we won't compete with, which used to end a
+    # session with most of the fuel budget unspent. Order within each tier is
+    # preserved; empty PRIORITY leaves the allied/neutral split unchanged.
     def prioritize(targets)
-      priority, rest = targets.partition do |target|
-        target[:sides].any? { |side| PRIORITY.include?(side[:country_id].to_i) }
-      end
-      priority + rest
+      targets.sort_by.with_index { |target, index| [tier(target), index] }
+    end
+
+    def tier(target)
+      return 0 if target[:sides].any? { |side| PRIORITY.include?(side[:country_id].to_i) }
+
+      target[:friendly] ? 1 : 2
     end
 
     def evaluate(battle)
@@ -47,7 +53,8 @@ module Erep
       battle_id = battle["id"] || battle["battle_id"]
 
       return nil if involves_enemy?(invader_id, defender_id)
-      return nil unless involves_friend?(invader_id, defender_id)
+
+      friendly = involves_friend?(invader_id, defender_id)
 
       div3 = find_div3_zone(battle)
       return nil unless div3
@@ -78,7 +85,7 @@ module Erep
         { country_id: invader_id, wall_pct: invader_wall, role: :invader }
       ]
 
-      { battle_id: battle_id, zone_id: zone_id, sides: sides }
+      { battle_id: battle_id, zone_id: zone_id, sides: sides, friendly: friendly }
     end
 
     def involves_enemy?(invader_id, defender_id)
